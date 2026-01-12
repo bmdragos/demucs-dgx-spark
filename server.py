@@ -49,7 +49,7 @@ import uvicorn
 analysis_pool: ProcessPoolExecutor = None
 
 # Constants
-SERVER_VERSION = "2.6.0"
+SERVER_VERSION = "2.7.0"
 RESULTS_DIR = Path("/workspace/results")
 EFFECTS_DIR = Path("/workspace/effects")
 SAMPLE_RATE = 44100
@@ -68,8 +68,7 @@ app = FastAPI(title="DJ Gizmo Server", version=SERVER_VERSION)
 
 # Global models (Demucs loaded at startup, Stable Audio lazy-loaded)
 demucs_model = None
-stable_audio_model = None
-stable_audio_config = None
+stable_audio_models = {}  # {"small": (model, config), "full": (model, config)}
 
 
 def load_demucs_model():
@@ -85,18 +84,31 @@ def load_demucs_model():
     return demucs_model
 
 
-def load_stable_audio_model():
-    """Load the Stable Audio Open model (lazy, on first use)."""
-    global stable_audio_model, stable_audio_config
-    if stable_audio_model is None:
+def load_stable_audio_model(model_name: str = "small"):
+    """Load a Stable Audio Open model (lazy, on first use).
+
+    Args:
+        model_name: "small" (497M, fast, max 11s) or "full" (1.2B, slow, max 47s)
+    """
+    global stable_audio_models
+
+    if model_name not in stable_audio_models:
         import torch
         from stable_audio_tools import get_pretrained_model
 
-        print("Loading Stable Audio Open model (first use, downloading ~3GB)...")
-        stable_audio_model, stable_audio_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
-        stable_audio_model = stable_audio_model.to("cuda")
-        print("Stable Audio Open loaded")
-    return stable_audio_model, stable_audio_config
+        if model_name == "small":
+            hf_id = "stabilityai/stable-audio-open-small"
+            print("Loading Stable Audio Open Small (497M, ~1s generation)...")
+        else:
+            hf_id = "stabilityai/stable-audio-open-1.0"
+            print("Loading Stable Audio Open 1.0 (1.2B, ~65s generation)...")
+
+        model, config = get_pretrained_model(hf_id)
+        model = model.to("cuda")
+        stable_audio_models[model_name] = (model, config)
+        print(f"Stable Audio '{model_name}' loaded")
+
+    return stable_audio_models[model_name]
 
 
 # --- Job Queue ---
@@ -133,6 +145,7 @@ class EffectJob:
     prompt: str
     duration: float = 5.0
     negative_prompt: str = "low quality, noise, distortion"
+    model: str = "small"  # "small" (fast, ≤11s) or "full" (slow, ≤47s)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
@@ -148,7 +161,7 @@ class EffectJobQueue:
         self.max_history = max_history
         self._lock = asyncio.Lock()
 
-    async def add(self, prompt: str, duration: float = 5.0, negative_prompt: str = "low quality, noise, distortion") -> EffectJob:
+    async def add(self, prompt: str, duration: float = 5.0, negative_prompt: str = "low quality, noise, distortion", model: str = "small") -> EffectJob:
         job_id = str(uuid.uuid4())[:8]
         job = EffectJob(
             id=job_id,
@@ -156,7 +169,8 @@ class EffectJobQueue:
             created_at=datetime.now(),
             prompt=prompt,
             duration=duration,
-            negative_prompt=negative_prompt
+            negative_prompt=negative_prompt,
+            model=model
         )
         async with self._lock:
             self.jobs[job_id] = job
@@ -693,11 +707,18 @@ async def process_effect_queue():
         await asyncio.sleep(0.5)
 
 
-def run_effect_generation(prompt: str, duration: float, negative_prompt: str):
-    """Blocking function to run effect generation on GPU. Called via asyncio.to_thread()."""
+def run_effect_generation(prompt: str, duration: float, negative_prompt: str, model_name: str = "small"):
+    """Blocking function to run effect generation on GPU. Called via asyncio.to_thread().
+
+    Args:
+        prompt: Text description of the sound effect
+        duration: Duration in seconds
+        negative_prompt: What to avoid in generation
+        model_name: "small" (fast, 8 steps) or "full" (slow, 100 steps)
+    """
     from stable_audio_tools.inference.generation import generate_diffusion_cond
 
-    model, model_config = load_stable_audio_model()
+    model, model_config = load_stable_audio_model(model_name)
     sample_rate = model_config["sample_rate"]
     sample_size = model_config["sample_size"]
 
@@ -707,13 +728,21 @@ def run_effect_generation(prompt: str, duration: float, negative_prompt: str):
         "seconds_total": duration
     }]
 
-    print(f"Generating effect: '{prompt}' ({duration}s)...")
+    # Model-specific settings
+    if model_name == "small":
+        steps = 8
+        cfg_scale = 1.0
+        print(f"Generating effect (small model): '{prompt}' ({duration}s, {steps} steps)...")
+    else:
+        steps = 100
+        cfg_scale = 7.0
+        print(f"Generating effect (full model): '{prompt}' ({duration}s, {steps} steps)...")
 
     with torch.no_grad():
         output = generate_diffusion_cond(
             model,
-            steps=100,
-            cfg_scale=7,
+            steps=steps,
+            cfg_scale=cfg_scale,
             conditioning=conditioning,
             negative_conditioning=[{"prompt": negative_prompt, "seconds_start": 0, "seconds_total": duration}],
             sample_size=sample_size,
@@ -754,7 +783,8 @@ async def generate_effect_job(job: EffectJob):
             run_effect_generation,
             job.prompt,
             job.duration,
-            job.negative_prompt
+            job.negative_prompt,
+            job.model
         )
 
         await effect_queue.update(job.id, stage="saving", progress=0.9)
@@ -1397,33 +1427,41 @@ async def render_stem_endpoint(
 async def generate_effect(
     prompt: str,
     duration: float = 5.0,
-    negative_prompt: str = "low quality, noise, distortion"
+    negative_prompt: str = "low quality, noise, distortion",
+    model: str = "small"
 ):
     """
     Queue a sound effect generation job using Stable Audio Open.
 
     Args:
         prompt: Text description of the sound effect (e.g., "Air horn blast. High-quality. Stereo.")
-        duration: Duration in seconds (1-47, default 5)
+        duration: Duration in seconds (default 5)
         negative_prompt: What to avoid in generation (default: "low quality, noise, distortion")
+        model: "small" (fast ~1s, max 11s) or "full" (slow ~65s, max 47s). Default: small
 
     Returns:
         Job info with ID to track status
     """
-    # Validate duration (Stable Audio supports up to 47 seconds)
-    if duration < 1 or duration > 47:
-        raise HTTPException(400, "Duration must be between 1 and 47 seconds")
+    # Validate model
+    if model not in ("small", "full"):
+        raise HTTPException(400, "Model must be 'small' or 'full'")
+
+    # Validate duration based on model
+    max_duration = 11 if model == "small" else 47
+    if duration < 1 or duration > max_duration:
+        raise HTTPException(400, f"Duration must be between 1 and {max_duration} seconds for '{model}' model")
 
     # Queue the job
-    job = await effect_queue.add(prompt, duration, negative_prompt)
+    job = await effect_queue.add(prompt, duration, negative_prompt, model)
 
     return {
         "job_id": job.id,
         "status": job.status.value,
         "prompt": job.prompt,
         "duration": job.duration,
+        "model": job.model,
         "created_at": job.created_at.isoformat(),
-        "message": "Effect generation queued. Poll /effects/{job_id} for status."
+        "message": f"Effect generation queued ({model} model). Poll /effects/{job.id} for status."
     }
 
 
@@ -1438,6 +1476,7 @@ async def list_effects(limit: int = 20):
                 "status": j.status.value,
                 "prompt": j.prompt,
                 "duration": j.duration,
+                "model": j.model,
                 "stage": j.stage,
                 "progress": j.progress,
                 "created_at": j.created_at.isoformat(),
@@ -1462,6 +1501,7 @@ async def get_effect_status(job_id: str):
         "status": job.status.value,
         "prompt": job.prompt,
         "duration": job.duration,
+        "model": job.model,
         "stage": job.stage,
         "progress": job.progress,
         "created_at": job.created_at.isoformat(),

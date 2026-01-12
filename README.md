@@ -12,7 +12,7 @@ AI-powered audio processing server for DGX Spark. Stem separation, audio analysi
 - **Audio Rendering** - Time-stretch, pitch-shift, cut/trim operations
 - **Real-time Updates** - Server-Sent Events for live job status
 - **Web UI** - Drag-and-drop file upload with real-time progress
-- **Fast GPU processing** - ~30s stem separation, ~65s effect generation on GB10
+- **Fast GPU processing** - ~30s stems, ~1s effects (small model) on GB10
 - **Multiple formats** - MP3, M4A, FLAC, WAV, OGG
 - **Download options** - Individual stems or all as ZIP
 - **Auto cleanup** - TTL-based cleanup (24h) and disk quota (5GB)
@@ -140,7 +140,8 @@ Returns a 44.1kHz stereo WAV file. Duration can be 1-47 seconds.
 | Parameter | Description |
 |-----------|-------------|
 | `prompt` | Text description of the sound effect |
-| `duration` | Length in seconds (1-47, default 5) |
+| `duration` | Length in seconds (default 5) |
+| `model` | `small` (fast ~1s, max 11s) or `full` (slow ~65s, max 47s). Default: `small` |
 | `negative_prompt` | What to avoid (default: "low quality, noise, distortion") |
 
 #### Prompting Tips
@@ -170,10 +171,15 @@ Returns a 44.1kHz stereo WAV file. Duration can be 1-47 seconds.
 "Clicking at 130 BPM"
 ```
 
+**Model comparison:**
+| Model | Generation Time | Max Duration | Best For |
+|-------|-----------------|--------------|----------|
+| `small` | ~1-2s | 11s | Quick sound effects, iteration |
+| `full` | ~65s | 47s | Longer clips, higher quality |
+
 **Known quirks:**
 - Some outputs sound MIDI-ish → add `"Live"` or `"Acoustic"`
 - Some outputs sound low-fi → add `"44.1kHz high-quality"`
-- Generation takes ~65s regardless of duration (model generates full 47s internally)
 
 #### Setup Required
 
@@ -224,7 +230,8 @@ MAX_JOB_HISTORY = 50          # Jobs to keep in memory
 - **Container:** `nvcr.io/nvidia/pytorch:25.12-py3`
 - **Models:**
   - Demucs htdemucs (hybrid transformer) - stem separation
-  - Stable Audio Open 1.0 (1.2B params) - sound effect generation
+  - Stable Audio Open Small (497M params, ~1s) - fast sound effects
+  - Stable Audio Open 1.0 (1.2B params, ~65s) - high quality generation
 - **Output:** 44.1kHz stereo WAV
 
 ## License
