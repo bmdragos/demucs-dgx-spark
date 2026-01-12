@@ -12,7 +12,7 @@ AI-powered audio processing server for DGX Spark. Stem separation, audio analysi
 - **Audio Rendering** - Time-stretch, pitch-shift, cut/trim operations
 - **Real-time Updates** - Server-Sent Events for live job status
 - **Web UI** - Drag-and-drop file upload with real-time progress
-- **Fast GPU processing** - ~6 minutes for stem separation on GB10
+- **Fast GPU processing** - ~30s stem separation, ~65s effect generation on GB10
 - **Multiple formats** - MP3, M4A, FLAC, WAV, OGG
 - **Download options** - Individual stems or all as ZIP
 - **Auto cleanup** - TTL-based cleanup (24h) and disk quota (5GB)
