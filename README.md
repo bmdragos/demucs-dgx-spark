@@ -6,7 +6,10 @@ AI-powered audio stem separation running on NVIDIA DGX Spark. Separates any song
 
 ## Features
 
-- **Web UI** - Drag-and-drop file upload with real-time job status
+- **Stem Separation** - Split any song into drums, bass, other, vocals
+- **Audio Analysis** - BPM, key detection, beat tracking, onset detection, waveform
+- **Real-time Updates** - Server-Sent Events for live job status
+- **Web UI** - Drag-and-drop file upload with real-time progress
 - **Fast GPU processing** - ~6 minutes for a typical song on GB10
 - **Multiple formats** - MP3, M4A, FLAC, WAV, OGG
 - **Download options** - Individual stems or all as ZIP
@@ -78,19 +81,54 @@ The `setup.sh` script installs packages with `--no-deps` to preserve NGC's PyTor
 |----------|--------|-------------|
 | `/` | GET | Web UI |
 | `/health` | GET | Server status, GPU stats, queue size |
-| `/separate` | POST | Upload file for separation |
+| `/separate` | POST | Upload file for stem separation (queued) |
+| `/analyze` | POST | Analyze audio for BPM, beats, onsets (immediate) |
 | `/jobs` | GET | List recent jobs |
+| `/jobs/stream` | GET | Server-Sent Events for real-time job updates |
 | `/jobs/{id}/download/{stem}.wav` | GET | Download individual stem |
 | `/jobs/{id}/download_all` | GET | Download all stems as ZIP |
 | `/storage` | GET | Disk usage info |
 | `/cleanup` | POST | Manual cleanup trigger |
+
+### Audio Analysis
+
+The `/analyze` endpoint returns timing information for DJ/music applications:
+
+```bash
+curl -X POST -F "file=@song.mp3" http://your-dgx:8081/analyze
+```
+
+```json
+{
+  "filename": "song.mp3",
+  "duration": 187.4,
+  "bpm": 128.0,
+  "key": "Am",
+  "beats": [0.0, 0.469, 0.938, 1.406, ...],
+  "downbeats": [0.0, 1.875, 3.75, 5.625, ...],
+  "onsets": [0.023, 0.482, 0.951, 1.217, ...],
+  "waveform": [0.1, 0.3, 0.8, 0.6, ...],
+  "beat_count": 400,
+  "onset_count": 1250
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `duration` | Total length in seconds |
+| `bpm` | Estimated tempo |
+| `key` | Musical key (e.g., "C", "Am", "F#m") |
+| `beats` | Every beat position in seconds |
+| `downbeats` | First beat of each bar (the "1" in 4/4) |
+| `onsets` | Transient/hit positions (drums, notes) |
+| `waveform` | RMS envelope (1000 points, normalized 0-1) |
 
 ## Configuration
 
 Edit constants in `server.py`:
 
 ```python
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 MAX_RESULTS_AGE_HOURS = 24    # Auto-delete results older than this
 MAX_RESULTS_SIZE_GB = 5.0     # Trigger cleanup when exceeded
 MAX_JOB_HISTORY = 50          # Jobs to keep in memory

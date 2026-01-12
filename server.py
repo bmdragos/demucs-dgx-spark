@@ -3,6 +3,7 @@ Demucs Audio Separation Server
 
 PyTorch Demucs inference server for DGX Spark.
 Separates audio into stems: drums, bass, other, vocals.
+Also provides audio analysis (BPM, beats, onsets).
 
 Endpoints:
   GET  /                        - Web dashboard with drag-and-drop upload
@@ -10,6 +11,7 @@ Endpoints:
   GET  /storage                 - Storage usage info
   POST /cleanup                 - Trigger manual cleanup
   POST /separate                - Upload and separate audio
+  POST /analyze                 - Analyze audio (BPM, beats, onsets)
   GET  /jobs                    - List jobs
   GET  /jobs/{id}               - Get job status/results
   GET  /jobs/{id}/download/{stem} - Download a stem
@@ -30,6 +32,7 @@ import subprocess
 import zipfile
 import shutil
 import time
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,12 +43,13 @@ from collections import deque
 import numpy as np
 import torch
 import soundfile as sf
+import librosa
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import uvicorn
 
 # Constants
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 RESULTS_DIR = Path("/workspace/results")
 SAMPLE_RATE = 44100
 STEMS = ["drums", "bass", "other", "vocals"]
@@ -98,6 +102,7 @@ class Job:
     result_path: Optional[str] = None
     progress: float = 0.0
     duration: float = 0.0
+    analysis: Optional[dict] = None  # Auto-analysis results
 
 
 class JobQueue:
@@ -255,6 +260,98 @@ def get_job_file_sizes(result_path: str) -> dict:
 job_queue = JobQueue()
 
 
+# --- Audio Analysis ---
+
+# Krumhansl-Schmuckler key profiles for key detection
+KEY_PROFILES = {
+    'major': [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
+    'minor': [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+}
+KEY_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+
+def detect_key(y, sr) -> str:
+    """Detect musical key using Krumhansl-Schmuckler algorithm."""
+    # Get chroma features
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    chroma_avg = np.mean(chroma, axis=1)
+
+    # Correlate with major/minor profiles for each root
+    best_corr = -1
+    best_key = "Unknown"
+
+    for mode, profile in KEY_PROFILES.items():
+        for shift in range(12):
+            # Rotate profile to match each root note
+            rotated = np.roll(profile, shift)
+            corr = np.corrcoef(chroma_avg, rotated)[0, 1]
+            if corr > best_corr:
+                best_corr = corr
+                suffix = "" if mode == 'major' else "m"
+                best_key = f"{KEY_NAMES[shift]}{suffix}"
+
+    return best_key
+
+
+def get_waveform_envelope(y, sr, num_points=1000) -> list:
+    """Get downsampled RMS envelope for visualization."""
+    # Compute RMS energy
+    rms = librosa.feature.rms(y=y)[0]
+
+    # Downsample to target number of points
+    if len(rms) > num_points:
+        step = len(rms) // num_points
+        rms = rms[::step][:num_points]
+
+    # Normalize to 0-1 range
+    if rms.max() > 0:
+        rms = rms / rms.max()
+
+    return [round(float(v), 3) for v in rms]
+
+
+def analyze_audio_file(file_path: str, include_waveform: bool = True) -> dict:
+    """Analyze a single audio file for BPM, beats, onsets, key, waveform."""
+    y, sr = librosa.load(file_path, sr=None)
+    duration = len(y) / sr
+
+    # Beat tracking
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+
+    if hasattr(tempo, '__len__'):
+        bpm = float(tempo[0]) if len(tempo) > 0 else 0.0
+    else:
+        bpm = float(tempo)
+
+    # Downbeats (every 4 beats)
+    downbeats = beats[::4] if beats else []
+
+    # Onset detection
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
+    onsets = librosa.frames_to_time(onset_frames, sr=sr).tolist()
+
+    # Key detection
+    key = detect_key(y, sr)
+
+    result = {
+        "duration": round(duration, 3),
+        "bpm": round(bpm, 1),
+        "key": key,
+        "beats": [round(b, 3) for b in beats],
+        "downbeats": [round(d, 3) for d in downbeats],
+        "onsets": [round(o, 3) for o in onsets],
+        "beat_count": len(beats),
+        "onset_count": len(onsets)
+    }
+
+    # Waveform envelope (optional, can be large)
+    if include_waveform:
+        result["waveform"] = get_waveform_envelope(y, sr)
+
+    return result
+
+
 # --- Audio Processing ---
 
 async def process_audio(job: Job, audio_data: bytes):
@@ -288,9 +385,8 @@ async def process_audio(job: Job, audio_data: bytes):
 
         await job_queue.update(job.id, progress=0.1)
 
-        # Load audio
+        # Load audio (keep temp_wav for analysis later)
         audio, sr = sf.read(str(temp_wav))
-        temp_wav.unlink()  # Clean up temp wav
 
         # Convert to (channels, samples)
         if audio.ndim == 1:
@@ -327,13 +423,38 @@ async def process_audio(job: Job, audio_data: bytes):
                 stem_file = result_dir / f"{stem_name}.wav"
                 zf.write(stem_file, f"{base_name}_{stem_name}.wav")
 
+        await job_queue.update(job.id, progress=0.92)
+
+        # Auto-analyze full mix and stems
+        print(f"Analyzing audio...")
+        analysis = {}
+
+        try:
+            # Analyze full mix
+            analysis["mix"] = analyze_audio_file(str(temp_wav))
+        except Exception as e:
+            analysis["mix"] = {"error": str(e)}
+        finally:
+            temp_wav.unlink()  # Clean up temp wav
+
+        await job_queue.update(job.id, progress=0.95)
+
+        # Analyze each stem
+        for stem_name in STEMS:
+            stem_file = result_dir / f"{stem_name}.wav"
+            try:
+                analysis[stem_name] = analyze_audio_file(str(stem_file))
+            except Exception as e:
+                analysis[stem_name] = {"error": str(e)}
+
         await job_queue.update(job.id,
                                status=JobStatus.COMPLETED,
                                completed_at=datetime.now(),
                                result_path=str(result_dir),
+                               analysis=analysis,
                                progress=1.0)
 
-        print(f"Job {job.id} completed: {duration:.1f}s audio -> 4 stems + ZIP")
+        print(f"Job {job.id} completed: {duration:.1f}s audio -> 4 stems + ZIP + analysis")
 
     except Exception as e:
         import traceback
@@ -475,6 +596,157 @@ async def separate_audio(file: UploadFile = File(...)):
     }
 
 
+@app.post("/analyze")
+async def analyze_audio(file: UploadFile = File(...)):
+    """Analyze audio for BPM, beats, and onsets. Returns immediately (no queue)."""
+    import tempfile
+
+    # Validate file extension
+    valid_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac')
+    if not file.filename.lower().endswith(valid_extensions):
+        raise HTTPException(400, f"Unsupported format. Use: {', '.join(valid_extensions)}")
+
+    # Read file
+    audio_data = await file.read()
+
+    # Size limit (100MB for analysis)
+    if len(audio_data) > 100 * 1024 * 1024:
+        raise HTTPException(400, "File too large for analysis (max 100MB)")
+
+    try:
+        # Save to temp file for librosa/ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=Path(file.filename).suffix, delete=False) as tmp:
+            tmp.write(audio_data)
+            tmp_path = tmp.name
+
+        # Load audio with librosa (handles format conversion via ffmpeg)
+        y, sr = librosa.load(tmp_path, sr=None)
+        Path(tmp_path).unlink()  # Clean up temp file
+
+        duration = len(y) / sr
+
+        # Beat tracking
+        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+
+        # Handle tempo - could be array or scalar depending on librosa version
+        if hasattr(tempo, '__len__'):
+            bpm = float(tempo[0]) if len(tempo) > 0 else 0.0
+        else:
+            bpm = float(tempo)
+
+        # Downbeats (every 4 beats, assuming 4/4 time)
+        downbeats = beats[::4] if beats else []
+
+        # Onset detection
+        onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
+        onsets = librosa.frames_to_time(onset_frames, sr=sr).tolist()
+
+        return {
+            "filename": file.filename,
+            "duration": round(duration, 3),
+            "bpm": round(bpm, 1),
+            "beats": [round(b, 3) for b in beats],
+            "downbeats": [round(d, 3) for d in downbeats],
+            "onsets": [round(o, 3) for o in onsets],
+            "beat_count": len(beats),
+            "onset_count": len(onsets)
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Analysis failed: {str(e)}")
+
+
+@app.get("/jobs/{job_id}/analyze")
+async def analyze_job_stems(job_id: str, stem: str = None):
+    """
+    Get analysis for stems from a completed separation job.
+    Returns cached auto-analysis if available, otherwise computes on-demand.
+
+    - No stem param: return all stems + mix analysis
+    - stem=drums|bass|other|vocals|mix: return specific analysis
+    """
+    job = await job_queue.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(400, "Job not complete")
+
+    # If we have cached analysis, use it
+    if job.analysis:
+        if stem:
+            if stem not in job.analysis:
+                raise HTTPException(400, f"Invalid stem. Use: mix, {', '.join(STEMS)}")
+            return {
+                "job_id": job_id,
+                "filename": job.filename,
+                "stem": stem,
+                "analysis": job.analysis[stem]
+            }
+        return {
+            "job_id": job_id,
+            "filename": job.filename,
+            "analysis": job.analysis
+        }
+
+    # Fallback: compute on-demand (for jobs created before auto-analysis)
+    result_path = Path(job.result_path)
+
+    # Determine which stems to analyze
+    if stem:
+        if stem not in STEMS:
+            raise HTTPException(400, f"Invalid stem. Use: {', '.join(STEMS)}")
+        stems_to_analyze = [stem]
+    else:
+        stems_to_analyze = STEMS
+
+    results = {}
+
+    for stem_name in stems_to_analyze:
+        stem_file = result_path / f"{stem_name}.wav"
+        if not stem_file.exists():
+            continue
+
+        try:
+            y, sr = librosa.load(str(stem_file), sr=None)
+            duration = len(y) / sr
+
+            # Beat tracking
+            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+            beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+
+            if hasattr(tempo, '__len__'):
+                bpm = float(tempo[0]) if len(tempo) > 0 else 0.0
+            else:
+                bpm = float(tempo)
+
+            # Downbeats (every 4 beats)
+            downbeats = beats[::4] if beats else []
+
+            # Onset detection
+            onset_frames = librosa.onset.onset_detect(y=y, sr=sr)
+            onsets = librosa.frames_to_time(onset_frames, sr=sr).tolist()
+
+            results[stem_name] = {
+                "duration": round(duration, 3),
+                "bpm": round(bpm, 1),
+                "beats": [round(b, 3) for b in beats],
+                "downbeats": [round(d, 3) for d in downbeats],
+                "onsets": [round(o, 3) for o in onsets],
+                "beat_count": len(beats),
+                "onset_count": len(onsets)
+            }
+        except Exception as e:
+            results[stem_name] = {"error": str(e)}
+
+    return {
+        "job_id": job_id,
+        "filename": job.filename,
+        "stems_analyzed": list(results.keys()),
+        "analysis": results
+    }
+
+
 @app.get("/jobs")
 async def list_jobs(limit: int = 20):
     """List recent jobs."""
@@ -490,12 +762,56 @@ async def list_jobs(limit: int = 20):
             "created_at": j.created_at.isoformat(),
             "error": j.error
         }
-        # Add file sizes for completed jobs
+        # Add file sizes and BPM for completed jobs
         if j.status == JobStatus.COMPLETED and j.result_path:
             sizes = get_job_file_sizes(j.result_path)
             job_data["sizes"] = {k: format_size(v) for k, v in sizes.items()}
+            # Include BPM from analysis if available
+            if j.analysis and "mix" in j.analysis:
+                job_data["bpm"] = j.analysis["mix"].get("bpm")
+                job_data["key"] = j.analysis["mix"].get("key")
         result.append(job_data)
     return {"jobs": result}
+
+
+@app.get("/jobs/stream")
+async def stream_jobs():
+    """Server-Sent Events stream for real-time job updates."""
+    async def event_generator():
+        last_data = None
+        while True:
+            # Build current jobs data
+            jobs = job_queue.list_jobs(20)
+            data = []
+            for j in jobs:
+                job_data = {
+                    "id": j.id,
+                    "filename": j.filename,
+                    "status": j.status.value,
+                    "progress": j.progress,
+                    "duration": j.duration,
+                    "error": j.error
+                }
+                if j.status == JobStatus.COMPLETED and j.result_path:
+                    sizes = get_job_file_sizes(j.result_path)
+                    job_data["sizes"] = {k: format_size(v) for k, v in sizes.items()}
+                    if j.analysis and "mix" in j.analysis:
+                        job_data["bpm"] = j.analysis["mix"].get("bpm")
+                data.append(job_data)
+
+            # Only send if data changed
+            current = json.dumps(data)
+            if current != last_data:
+                last_data = current
+                yield f"data: {current}\n\n"
+
+            await asyncio.sleep(0.3)  # Check every 300ms
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
 
 
 @app.get("/jobs/{job_id}")
@@ -521,6 +837,9 @@ async def get_job(job_id: str):
             stem: f"/jobs/{job_id}/download/{stem}.wav"
             for stem in STEMS
         }
+        # Include analysis if available
+        if job.analysis:
+            result["analysis"] = job.analysis
 
     return result
 
@@ -570,4 +889,15 @@ async def download_all_stems(job_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    # Check for SSL certs
+    cert_file = Path(__file__).parent / "192.168.1.159.pem"
+    key_file = Path(__file__).parent / "192.168.1.159-key.pem"
+
+    if cert_file.exists() and key_file.exists():
+        print("Starting with HTTPS...")
+        uvicorn.run(app, host="0.0.0.0", port=8081,
+                    ssl_certfile=str(cert_file),
+                    ssl_keyfile=str(key_file))
+    else:
+        print("No SSL certs found, starting with HTTP...")
+        uvicorn.run(app, host="0.0.0.0", port=8081)

@@ -558,14 +558,36 @@
             }).join('');
         }
 
+        // Server-Sent Events for real-time job updates
+        let eventSource = null;
+
+        function connectJobStream() {
+            if (eventSource) eventSource.close();
+            eventSource = new EventSource('/jobs/stream');
+            eventSource.onmessage = (e) => {
+                try {
+                    const jobs = JSON.parse(e.data);
+                    renderJobs(jobs);
+                } catch (err) {
+                    console.error('Failed to parse job data:', err);
+                }
+            };
+            eventSource.onerror = () => {
+                console.log('SSE connection lost, reconnecting...');
+                eventSource.close();
+                setTimeout(connectJobStream, 2000);
+            };
+        }
+
+        // Fallback for initial load
         async function refreshJobs() {
             try {
                 const resp = await fetch('/jobs');
                 const data = await resp.json();
                 renderJobs(data.jobs);
-                const hasActive = data.jobs.some(j => j.status === 'queued' || j.status === 'processing');
-                if (hasActive) setTimeout(refreshJobs, 2000);
-            } catch (err) { console.error('Failed to refresh jobs:', err); }
+            } catch (err) {
+                console.error('Failed to refresh jobs:', err);
+            }
         }
 
         async function refreshStats() {
@@ -583,7 +605,7 @@
         }
 
         refreshStats();
-        refreshJobs();
+        connectJobStream();  // Start SSE stream for real-time job updates
         setInterval(refreshStats, 5000);
     </script>
 </body>

@@ -21,7 +21,7 @@ echo "  Done"
 
 # Step 2: Install safe dependencies
 echo "Step 2: Installing safe dependencies..."
-pip install einops julius lameenc pyyaml tqdm soundfile dora-search -q
+pip install einops julius lameenc pyyaml tqdm soundfile dora-search librosa -q
 echo "  Done"
 
 # Step 3: Install torch-dependent packages without deps
@@ -47,6 +47,7 @@ python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
 python -c "from demucs.pretrained import get_model; print('demucs.pretrained: OK')"
 python -c "from demucs.apply import apply_model; print('demucs.apply: OK')"
 python -c "from fastapi import FastAPI; print('fastapi: OK')"
+python -c "import librosa; print('librosa: OK')"
 
 echo ""
 echo "=== Setup Complete ==="
