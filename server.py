@@ -1,27 +1,23 @@
 """
-Demucs Audio Separation Server
+DJ Gizmo - Audio Separation & Generation Server
 
-PyTorch Demucs inference server for DGX Spark.
-Separates audio into stems: drums, bass, other, vocals.
-Also provides audio analysis (BPM, beats, onsets).
+PyTorch inference server for DGX Spark.
+- Stem separation via Demucs (drums, bass, other, vocals)
+- Audio analysis (BPM, key, beats, onsets, segments)
+- Sound effect generation via AudioGen (text-to-sound)
+- Stem rendering (time-stretch, pitch-shift, cut)
 
 Endpoints:
-  GET  /                        - Web dashboard with drag-and-drop upload
+  GET  /                        - Web dashboard
   GET  /health                  - Health check with GPU stats
-  GET  /storage                 - Storage usage info
-  POST /cleanup                 - Trigger manual cleanup
   POST /separate                - Upload and separate audio
   POST /analyze                 - Analyze audio (BPM, beats, onsets)
+  POST /generate_effect         - Generate sound effect from text
+  POST /jobs/{id}/render        - Render stem with effects
   GET  /jobs                    - List jobs
   GET  /jobs/{id}               - Get job status/results
   GET  /jobs/{id}/download/{stem} - Download a stem
   GET  /jobs/{id}/download_all  - Download all stems as ZIP
-
-Cleanup:
-  - Startup: Cleans orphaned results from previous sessions
-  - TTL: Deletes results older than MAX_RESULTS_AGE_HOURS (24h)
-  - Quota: Deletes oldest when exceeding MAX_RESULTS_SIZE_GB (5GB)
-  - Manual: POST /cleanup to trigger all cleanups
 """
 
 import os
@@ -53,8 +49,9 @@ import uvicorn
 analysis_pool: ProcessPoolExecutor = None
 
 # Constants
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.6.0"
 RESULTS_DIR = Path("/workspace/results")
+EFFECTS_DIR = Path("/workspace/effects")
 SAMPLE_RATE = 44100
 STEMS = ["drums", "bass", "other", "vocals"]
 
@@ -65,24 +62,41 @@ MAX_JOB_HISTORY = 50        # Keep this many jobs in memory
 
 # Ensure directories exist
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+EFFECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Demucs Separation Server", version=SERVER_VERSION)
+app = FastAPI(title="DJ Gizmo Server", version=SERVER_VERSION)
 
-# Global model (loaded once at startup)
-model = None
+# Global models (Demucs loaded at startup, Stable Audio lazy-loaded)
+demucs_model = None
+stable_audio_model = None
+stable_audio_config = None
 
 
 def load_demucs_model():
     """Load the Demucs model."""
-    global model
-    if model is None:
+    global demucs_model
+    if demucs_model is None:
         from demucs.pretrained import get_model
         print("Loading htdemucs model...")
-        model = get_model('htdemucs')
-        model.cuda()
-        model.eval()
-        print(f"Model loaded on {next(model.parameters()).device}")
-    return model
+        demucs_model = get_model('htdemucs')
+        demucs_model.cuda()
+        demucs_model.eval()
+        print(f"Demucs loaded on {next(demucs_model.parameters()).device}")
+    return demucs_model
+
+
+def load_stable_audio_model():
+    """Load the Stable Audio Open model (lazy, on first use)."""
+    global stable_audio_model, stable_audio_config
+    if stable_audio_model is None:
+        import torch
+        from stable_audio_tools import get_pretrained_model
+
+        print("Loading Stable Audio Open model (first use, downloading ~3GB)...")
+        stable_audio_model, stable_audio_config = get_pretrained_model("stabilityai/stable-audio-open-1.0")
+        stable_audio_model = stable_audio_model.to("cuda")
+        print("Stable Audio Open loaded")
+    return stable_audio_model, stable_audio_config
 
 
 # --- Job Queue ---
@@ -109,6 +123,81 @@ class Job:
     analysis: Optional[dict] = None  # Auto-analysis results
     stage: str = "queued"  # queued, loading, separating, saving, analyzing, complete
     num_segments: int = 10  # Number of segment boundaries to detect
+
+
+@dataclass
+class EffectJob:
+    id: str
+    status: JobStatus
+    created_at: datetime
+    prompt: str
+    duration: float = 5.0
+    negative_prompt: str = "low quality, noise, distortion"
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+    output_path: Optional[str] = None
+    progress: float = 0.0
+    stage: str = "queued"  # queued, loading, generating, saving, complete
+
+
+class EffectJobQueue:
+    def __init__(self, max_history: int = MAX_JOB_HISTORY):
+        self.jobs: dict[str, EffectJob] = {}
+        self.queue: deque[str] = deque()
+        self.max_history = max_history
+        self._lock = asyncio.Lock()
+
+    async def add(self, prompt: str, duration: float = 5.0, negative_prompt: str = "low quality, noise, distortion") -> EffectJob:
+        job_id = str(uuid.uuid4())[:8]
+        job = EffectJob(
+            id=job_id,
+            status=JobStatus.QUEUED,
+            created_at=datetime.now(),
+            prompt=prompt,
+            duration=duration,
+            negative_prompt=negative_prompt
+        )
+        async with self._lock:
+            self.jobs[job_id] = job
+            self.queue.append(job_id)
+            self._cleanup_old_jobs()
+        return job
+
+    async def get(self, job_id: str) -> Optional[EffectJob]:
+        return self.jobs.get(job_id)
+
+    async def next(self) -> Optional[EffectJob]:
+        async with self._lock:
+            if self.queue:
+                job_id = self.queue.popleft()
+                return self.jobs.get(job_id)
+        return None
+
+    async def update(self, job_id: str, **kwargs):
+        if job_id in self.jobs:
+            for k, v in kwargs.items():
+                setattr(self.jobs[job_id], k, v)
+
+    def _cleanup_old_jobs(self):
+        """Remove jobs exceeding max_history from memory."""
+        completed = [j for j in self.jobs.values()
+                     if j.status in (JobStatus.COMPLETED, JobStatus.FAILED)]
+        if len(completed) > self.max_history:
+            completed.sort(key=lambda x: x.completed_at or x.created_at)
+            for job in completed[:-self.max_history]:
+                if job.output_path and Path(job.output_path).exists():
+                    Path(job.output_path).unlink(missing_ok=True)
+                del self.jobs[job.id]
+
+    def list_jobs(self, limit: int = 20) -> list[EffectJob]:
+        jobs = sorted(self.jobs.values(),
+                      key=lambda x: x.created_at, reverse=True)
+        return jobs[:limit]
+
+    def known_job_ids(self) -> set[str]:
+        """Return set of job IDs currently tracked."""
+        return set(self.jobs.keys())
 
 
 class JobQueue:
@@ -228,13 +317,61 @@ def cleanup_by_disk_quota(max_gb: float = MAX_RESULTS_SIZE_GB) -> int:
     return deleted
 
 
-def run_all_cleanups(known_ids: set[str]) -> dict:
+def get_effects_disk_usage() -> float:
+    """Get total size of effects directory in GB."""
+    total = 0
+    if EFFECTS_DIR.exists():
+        for f in EFFECTS_DIR.rglob('*'):
+            if f.is_file():
+                total += f.stat().st_size
+    return total / (1024 ** 3)
+
+
+def cleanup_orphaned_effects(known_ids: set[str]) -> int:
+    """Delete effect files not tracked by effect queue. Returns count deleted."""
+    deleted = 0
+    if not EFFECTS_DIR.exists():
+        return 0
+    for item in EFFECTS_DIR.iterdir():
+        if item.is_file() and item.suffix == '.wav':
+            # Extract job_id from filename (format: {job_id}_{prompt}.wav)
+            job_id = item.name.split('_')[0]
+            if job_id not in known_ids:
+                item.unlink(missing_ok=True)
+                deleted += 1
+    return deleted
+
+
+def cleanup_old_effects(max_age_hours: float = MAX_RESULTS_AGE_HOURS) -> int:
+    """Delete effect files older than max_age_hours. Returns count deleted."""
+    deleted = 0
+    if not EFFECTS_DIR.exists():
+        return 0
+    cutoff = time.time() - (max_age_hours * 3600)
+    for item in EFFECTS_DIR.iterdir():
+        if item.is_file() and item.suffix == '.wav':
+            try:
+                mtime = item.stat().st_mtime
+                if mtime < cutoff:
+                    item.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError:
+                pass
+    return deleted
+
+
+def run_all_cleanups(known_ids: set[str], known_effect_ids: set[str] = None) -> dict:
     """Run all cleanup routines. Returns summary."""
+    if known_effect_ids is None:
+        known_effect_ids = set()
     return {
         "orphaned_deleted": cleanup_orphaned_results(known_ids),
         "expired_deleted": cleanup_old_results(),
         "quota_deleted": cleanup_by_disk_quota(),
-        "disk_usage_gb": round(get_results_disk_usage(), 2)
+        "disk_usage_gb": round(get_results_disk_usage(), 2),
+        "effects_orphaned_deleted": cleanup_orphaned_effects(known_effect_ids),
+        "effects_expired_deleted": cleanup_old_effects(),
+        "effects_disk_usage_gb": round(get_effects_disk_usage(), 2)
     }
 
 
@@ -265,6 +402,7 @@ def get_job_file_sizes(result_path: str) -> dict:
 
 
 job_queue = JobQueue()
+effect_queue = EffectJobQueue()
 
 
 # --- Audio Analysis ---
@@ -546,12 +684,115 @@ async def process_queue():
         await asyncio.sleep(0.5)
 
 
+async def process_effect_queue():
+    """Background worker to process effect generation queue."""
+    while True:
+        job = await effect_queue.next()
+        if job:
+            await generate_effect_job(job)
+        await asyncio.sleep(0.5)
+
+
+def run_effect_generation(prompt: str, duration: float, negative_prompt: str):
+    """Blocking function to run effect generation on GPU. Called via asyncio.to_thread()."""
+    from stable_audio_tools.inference.generation import generate_diffusion_cond
+
+    model, model_config = load_stable_audio_model()
+    sample_rate = model_config["sample_rate"]
+    sample_size = model_config["sample_size"]
+
+    conditioning = [{
+        "prompt": prompt,
+        "seconds_start": 0,
+        "seconds_total": duration
+    }]
+
+    print(f"Generating effect: '{prompt}' ({duration}s)...")
+
+    with torch.no_grad():
+        output = generate_diffusion_cond(
+            model,
+            steps=100,
+            cfg_scale=7,
+            conditioning=conditioning,
+            negative_conditioning=[{"prompt": negative_prompt, "seconds_start": 0, "seconds_total": duration}],
+            sample_size=sample_size,
+            sample_rate=sample_rate,
+            device="cuda"
+        )
+
+    # output shape is (batch, channels, samples) - get first item
+    audio = output[0].cpu().numpy()
+
+    # Trim to requested duration
+    target_samples = int(sample_rate * duration)
+    audio = audio[:, :target_samples]
+
+    # Transpose: (channels, samples) -> (samples, channels) for soundfile
+    audio = audio.T
+
+    # Normalize to prevent clipping
+    max_val = np.abs(audio).max()
+    if max_val > 0:
+        audio = audio / max_val * 0.95
+
+    return audio, sample_rate
+
+
+async def generate_effect_job(job: EffectJob):
+    """Process a single effect generation job."""
+    try:
+        await effect_queue.update(job.id,
+                                  status=JobStatus.PROCESSING,
+                                  started_at=datetime.now(),
+                                  stage="loading")
+
+        await effect_queue.update(job.id, stage="generating", progress=0.1)
+
+        # Run generation in thread to avoid blocking event loop
+        audio, sample_rate = await asyncio.to_thread(
+            run_effect_generation,
+            job.prompt,
+            job.duration,
+            job.negative_prompt
+        )
+
+        await effect_queue.update(job.id, stage="saving", progress=0.9)
+
+        # Build filename from prompt
+        safe_prompt = "".join(c if c.isalnum() or c in " -_" else "" for c in job.prompt)
+        safe_prompt = safe_prompt.replace(" ", "_")[:50]
+        output_filename = f"{job.id}_{safe_prompt}.wav"
+        output_path = EFFECTS_DIR / output_filename
+
+        # Write to file
+        await asyncio.to_thread(sf.write, output_path, audio, sample_rate)
+
+        print(f"Generated effect: {output_filename} ({sample_rate}Hz)")
+
+        await effect_queue.update(job.id,
+                                  status=JobStatus.COMPLETED,
+                                  completed_at=datetime.now(),
+                                  output_path=str(output_path),
+                                  progress=1.0,
+                                  stage="complete")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        await effect_queue.update(job.id,
+                                  status=JobStatus.FAILED,
+                                  completed_at=datetime.now(),
+                                  error=str(e),
+                                  stage="failed")
+
+
 @app.on_event("startup")
 async def startup():
     global analysis_pool
 
     # Run cleanup on startup (orphaned files from previous sessions)
-    cleanup_result = run_all_cleanups(job_queue.known_job_ids())
+    cleanup_result = run_all_cleanups(job_queue.known_job_ids(), effect_queue.known_job_ids())
     print(f"Startup cleanup: {cleanup_result}")
 
     # Pre-load model
@@ -561,8 +802,19 @@ async def startup():
     analysis_pool = ProcessPoolExecutor(max_workers=5)
     print("Analysis process pool ready (5 workers)")
 
-    # Start queue processor
+    # Start queue processors
     asyncio.create_task(process_queue())
+    asyncio.create_task(process_effect_queue())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Clean up process pool to prevent zombie processes."""
+    global analysis_pool
+    if analysis_pool:
+        print("Shutting down analysis process pool...")
+        analysis_pool.shutdown(wait=False, cancel_futures=True)
+        print("Process pool closed")
 
 
 # --- API Endpoints ---
@@ -613,14 +865,15 @@ async def health():
         "model": "htdemucs",
         "gpu": gpu,
         "queue_size": len(job_queue.queue),
+        "effect_queue_size": len(effect_queue.queue),
         "cuda_available": torch.cuda.is_available()
     }
 
 
 @app.post("/cleanup")
 async def cleanup():
-    """Manually trigger cleanup of old results."""
-    result = run_all_cleanups(job_queue.known_job_ids())
+    """Manually trigger cleanup of old results and effects."""
+    result = run_all_cleanups(job_queue.known_job_ids(), effect_queue.known_job_ids())
     return {
         "status": "ok",
         "cleanup": result
@@ -1136,6 +1389,140 @@ async def render_stem_endpoint(
         media_type="audio/wav",
         headers={"Content-Disposition": f'attachment; filename="{output_filename}"'}
     )
+
+
+# --- Sound Effect Generation (Stable Audio Open) ---
+
+@app.post("/generate_effect")
+async def generate_effect(
+    prompt: str,
+    duration: float = 5.0,
+    negative_prompt: str = "low quality, noise, distortion"
+):
+    """
+    Queue a sound effect generation job using Stable Audio Open.
+
+    Args:
+        prompt: Text description of the sound effect (e.g., "Air horn blast. High-quality. Stereo.")
+        duration: Duration in seconds (1-47, default 5)
+        negative_prompt: What to avoid in generation (default: "low quality, noise, distortion")
+
+    Returns:
+        Job info with ID to track status
+    """
+    # Validate duration (Stable Audio supports up to 47 seconds)
+    if duration < 1 or duration > 47:
+        raise HTTPException(400, "Duration must be between 1 and 47 seconds")
+
+    # Queue the job
+    job = await effect_queue.add(prompt, duration, negative_prompt)
+
+    return {
+        "job_id": job.id,
+        "status": job.status.value,
+        "prompt": job.prompt,
+        "duration": job.duration,
+        "created_at": job.created_at.isoformat(),
+        "message": "Effect generation queued. Poll /effects/{job_id} for status."
+    }
+
+
+@app.get("/effects")
+async def list_effects(limit: int = 20):
+    """List recent effect generation jobs."""
+    jobs = effect_queue.list_jobs(limit)
+    return {
+        "effects": [
+            {
+                "job_id": j.id,
+                "status": j.status.value,
+                "prompt": j.prompt,
+                "duration": j.duration,
+                "stage": j.stage,
+                "progress": j.progress,
+                "created_at": j.created_at.isoformat(),
+                "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+                "error": j.error
+            }
+            for j in jobs
+        ],
+        "queue_size": len(effect_queue.queue)
+    }
+
+
+@app.get("/effects/{job_id}")
+async def get_effect_status(job_id: str):
+    """Get status of an effect generation job."""
+    job = await effect_queue.get(job_id)
+    if not job:
+        raise HTTPException(404, f"Effect job {job_id} not found")
+
+    return {
+        "job_id": job.id,
+        "status": job.status.value,
+        "prompt": job.prompt,
+        "duration": job.duration,
+        "stage": job.stage,
+        "progress": job.progress,
+        "created_at": job.created_at.isoformat(),
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "error": job.error,
+        "download_url": f"/effects/{job.id}/download" if job.status == JobStatus.COMPLETED else None
+    }
+
+
+@app.get("/effects/{job_id}/download")
+async def download_effect(job_id: str):
+    """Download a generated sound effect."""
+    job = await effect_queue.get(job_id)
+    if not job:
+        raise HTTPException(404, f"Effect job {job_id} not found")
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(400, f"Effect not ready. Status: {job.status.value}, Stage: {job.stage}")
+
+    if not job.output_path or not Path(job.output_path).exists():
+        raise HTTPException(404, "Effect file not found")
+
+    return FileResponse(
+        job.output_path,
+        media_type="audio/wav",
+        filename=Path(job.output_path).name
+    )
+
+
+@app.get("/effects/examples")
+async def list_effect_examples():
+    """Return example prompts for sound effect generation."""
+    return {
+        "examples": [
+            # DJ / Music
+            "air horn blast",
+            "vinyl scratch",
+            "record rewind",
+            "bass drop",
+            "synth riser",
+            "drum roll",
+            "cymbal crash",
+            "dj siren",
+            # Impacts
+            "explosion",
+            "thunder crack",
+            "glass breaking",
+            "door slam",
+            # Ambient
+            "crowd cheering",
+            "applause",
+            "rain on window",
+            "wind howling",
+            # Funny
+            "fart sound",
+            "cartoon boing",
+            "sad trombone",
+            "wrong answer buzzer",
+        ]
+    }
 
 
 if __name__ == "__main__":
