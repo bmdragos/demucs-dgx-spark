@@ -103,6 +103,7 @@ class Job:
     progress: float = 0.0
     duration: float = 0.0
     analysis: Optional[dict] = None  # Auto-analysis results
+    stage: str = "queued"  # queued, loading, separating, saving, analyzing, complete
 
 
 class JobQueue:
@@ -359,7 +360,9 @@ async def process_audio(job: Job, audio_data: bytes):
     try:
         await job_queue.update(job.id,
                                status=JobStatus.PROCESSING,
-                               started_at=datetime.now())
+                               started_at=datetime.now(),
+                               stage="loading")
+        await asyncio.sleep(0)  # Yield to event loop for SSE
 
         # Load model
         demucs_model = load_demucs_model()
@@ -371,8 +374,8 @@ async def process_audio(job: Job, audio_data: bytes):
 
         temp_input.write_bytes(audio_data)
 
-        # Convert to WAV using ffmpeg
-        result = subprocess.run([
+        # Convert to WAV using ffmpeg (run in thread to not block event loop)
+        result = await asyncio.to_thread(subprocess.run, [
             'ffmpeg', '-y', '-i', str(temp_input),
             '-ar', str(SAMPLE_RATE), '-ac', '2',
             str(temp_wav)
@@ -383,10 +386,8 @@ async def process_audio(job: Job, audio_data: bytes):
         if not temp_wav.exists():
             raise RuntimeError(f"FFmpeg conversion failed: {result.stderr.decode()}")
 
-        await job_queue.update(job.id, progress=0.1)
-
         # Load audio (keep temp_wav for analysis later)
-        audio, sr = sf.read(str(temp_wav))
+        audio, sr = await asyncio.to_thread(sf.read, str(temp_wav))
 
         # Convert to (channels, samples)
         if audio.ndim == 1:
@@ -395,25 +396,31 @@ async def process_audio(job: Job, audio_data: bytes):
             audio = audio.T
 
         duration = audio.shape[1] / sr
-        await job_queue.update(job.id, duration=duration, progress=0.2)
+        await job_queue.update(job.id, duration=duration, stage="separating")
+        await asyncio.sleep(0)  # Yield to event loop for SSE
 
         # Convert to tensor
         waveform = torch.tensor(audio, dtype=torch.float32, device='cuda')
 
-        # Run separation
+        # Run separation (in thread to allow SSE updates)
         print(f"Separating {duration:.1f}s of audio...")
-        with torch.no_grad():
-            sources = apply_model(demucs_model, waveform.unsqueeze(0), progress=True)[0]
+        def run_separation():
+            with torch.no_grad():
+                return apply_model(demucs_model, waveform.unsqueeze(0), progress=True)[0]
+        sources = await asyncio.to_thread(run_separation)
 
-        await job_queue.update(job.id, progress=0.9)
+        await job_queue.update(job.id, stage="saving")
+        await asyncio.sleep(0)  # Yield to event loop for SSE
 
         # Save results
         result_dir = RESULTS_DIR / job.id
         result_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, stem_name in enumerate(STEMS):
-            stem_audio = sources[i].T.cpu().numpy()
-            sf.write(str(result_dir / f"{stem_name}.wav"), stem_audio, sr)
+        def save_stems():
+            for i, stem_name in enumerate(STEMS):
+                stem_audio = sources[i].T.cpu().numpy()
+                sf.write(str(result_dir / f"{stem_name}.wav"), stem_audio, sr)
+        await asyncio.to_thread(save_stems)
 
         # Pre-create ZIP file (no compression - WAV doesn't compress well)
         base_name = Path(job.filename).stem
@@ -423,7 +430,8 @@ async def process_audio(job: Job, audio_data: bytes):
                 stem_file = result_dir / f"{stem_name}.wav"
                 zf.write(stem_file, f"{base_name}_{stem_name}.wav")
 
-        await job_queue.update(job.id, progress=0.92)
+        await job_queue.update(job.id, stage="analyzing")
+        await asyncio.sleep(0)  # Yield to event loop for SSE
 
         # Auto-analyze full mix and stems
         print(f"Analyzing audio...")
@@ -436,8 +444,6 @@ async def process_audio(job: Job, audio_data: bytes):
             analysis["mix"] = {"error": str(e)}
         finally:
             temp_wav.unlink()  # Clean up temp wav
-
-        await job_queue.update(job.id, progress=0.95)
 
         # Analyze each stem
         for stem_name in STEMS:
@@ -452,7 +458,7 @@ async def process_audio(job: Job, audio_data: bytes):
                                completed_at=datetime.now(),
                                result_path=str(result_dir),
                                analysis=analysis,
-                               progress=1.0)
+                               stage="complete")
 
         print(f"Job {job.id} completed: {duration:.1f}s audio -> 4 stems + ZIP + analysis")
 
@@ -757,7 +763,7 @@ async def list_jobs(limit: int = 20):
             "id": j.id,
             "filename": j.filename,
             "status": j.status.value,
-            "progress": j.progress,
+            "stage": j.stage,
             "duration": j.duration,
             "created_at": j.created_at.isoformat(),
             "error": j.error
@@ -788,7 +794,7 @@ async def stream_jobs():
                     "id": j.id,
                     "filename": j.filename,
                     "status": j.status.value,
-                    "progress": j.progress,
+                    "stage": j.stage,
                     "duration": j.duration,
                     "error": j.error
                 }
@@ -825,7 +831,7 @@ async def get_job(job_id: str):
         "id": job.id,
         "filename": job.filename,
         "status": job.status.value,
-        "progress": job.progress,
+        "stage": job.stage,
         "duration": job.duration,
         "created_at": job.created_at.isoformat(),
         "error": job.error

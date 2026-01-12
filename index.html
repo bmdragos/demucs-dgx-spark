@@ -31,7 +31,7 @@
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1500px;
             margin: 0 auto;
             padding: 40px 24px;
         }
@@ -284,19 +284,62 @@
             50% { opacity: 0.4; }
         }
 
-        /* Progress Bar */
-        .progress-bar {
-            width: 100px;
-            height: 6px;
+        /* Pizza Tracker Style Stage Indicator */
+        .stage-tracker {
+            display: flex;
+            align-items: center;
             background: var(--bg-tertiary);
-            border-radius: 3px;
-            overflow: hidden;
+            border-radius: 20px;
+            padding: 4px;
+            min-width: 320px;
         }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--accent), #9be000);
-            border-radius: 3px;
-            transition: width 0.3s;
+        .stage-step {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 6px 8px;
+            border-radius: 16px;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            transition: all 0.3s ease;
+        }
+        .stage-step .step-num {
+            font-weight: 700;
+            font-size: 14px;
+            margin-bottom: 2px;
+        }
+        .stage-step .step-label {
+            color: var(--text-muted);
+            font-size: 9px;
+        }
+        .stage-step.pending {
+            color: var(--text-muted);
+        }
+        .stage-step.active {
+            background: var(--accent);
+            color: #000;
+            transform: scale(1.05);
+            box-shadow: 0 0 12px rgba(118, 185, 0, 0.5);
+            animation: pulse 1.5s infinite;
+        }
+        .stage-step.active .step-label {
+            color: #000;
+        }
+        .stage-step.done {
+            background: rgba(118, 185, 0, 0.3);
+            color: var(--accent);
+        }
+        .stage-step.done .step-label {
+            color: var(--accent);
+        }
+        .stage-step.complete-done {
+            background: var(--success);
+            color: #000;
+        }
+        .stage-step.complete-done .step-label {
+            color: #000;
         }
 
         /* Download Links */
@@ -446,7 +489,7 @@
                         <th>ID</th>
                         <th>File</th>
                         <th>Status</th>
-                        <th>Progress</th>
+                        <th>Stage</th>
                         <th>Duration</th>
                         <th>Download</th>
                     </tr>
@@ -525,7 +568,15 @@
 
             jobsBody.innerHTML = jobs.map(job => {
                 const filename = job.filename.length > 25 ? job.filename.slice(0, 25) + '...' : job.filename;
-                const progressPct = (job.progress * 100).toFixed(0);
+                const stages = [
+                    {id: 'queued', label: 'Queued'},
+                    {id: 'loading', label: 'Loading'},
+                    {id: 'separating', label: 'Separating'},
+                    {id: 'saving', label: 'Saving'},
+                    {id: 'analyzing', label: 'Analyzing'},
+                    {id: 'complete', label: 'Done'}
+                ];
+                const currentStageIdx = stages.findIndex(s => s.id === job.stage);
 
                 let downloads = '';
                 if (job.status === 'completed') {
@@ -547,11 +598,24 @@
                     downloads = `<span style="color:var(--error);font-size:12px">${job.error?.slice(0,30) || 'Failed'}</span>`;
                 }
 
+                const stageDisplay = stages.map((s, i) => {
+                    let cls = 'stage-step';
+                    if (i < currentStageIdx) {
+                        cls += ' done';
+                    } else if (i === currentStageIdx) {
+                        // Don't pulse on complete
+                        cls += job.stage === 'complete' ? ' complete-done' : ' active';
+                    } else {
+                        cls += ' pending';
+                    }
+                    return `<span class="${cls}"><span class="step-num">${i + 1}</span><span class="step-label">${s.label}</span></span>`;
+                }).join('');
+
                 return `<tr>
                     <td><span class="job-id">${job.id}</span></td>
                     <td><span class="job-filename" title="${job.filename}">${filename}</span></td>
                     <td><span class="status-badge ${job.status}">${job.status}</span></td>
-                    <td><div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%"></div></div></td>
+                    <td><div class="stage-tracker">${stageDisplay}</div></td>
                     <td>${job.duration.toFixed(1)}s</td>
                     <td><div class="download-links">${downloads}</div></td>
                 </tr>`;
