@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Demucs - AI Audio Stem Separation</title>
+    <title>DJ Gizmo - AI Audio Stem Separation</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -439,7 +439,7 @@
         <header class="header">
             <div class="logo">
                 <div class="logo-icon">&#127925;</div>
-                <h1>Demucs<span id="version"></span></h1>
+                <h1>DJ Gizmo<span id="version"></span></h1>
             </div>
             <p class="tagline">AI-powered audio stem separation on <strong>DGX Spark</strong></p>
         </header>
@@ -490,12 +490,13 @@
                         <th>File</th>
                         <th>Status</th>
                         <th>Stage</th>
-                        <th>Duration</th>
+                        <th>Length</th>
+                        <th>Process</th>
                         <th>Download</th>
                     </tr>
                 </thead>
                 <tbody id="jobs-body">
-                    <tr><td colspan="6" class="empty-state">No jobs yet - upload a file to get started</td></tr>
+                    <tr><td colspan="7" class="empty-state">No jobs yet - upload a file to get started</td></tr>
                 </tbody>
             </table>
         </div>
@@ -562,7 +563,7 @@
 
         function renderJobs(jobs) {
             if (!jobs.length) {
-                jobsBody.innerHTML = '<tr><td colspan="6" class="empty-state">No jobs yet - upload a file to get started</td></tr>';
+                jobsBody.innerHTML = '<tr><td colspan="7" class="empty-state">No jobs yet - upload a file to get started</td></tr>';
                 return;
             }
 
@@ -617,6 +618,7 @@
                     <td><span class="status-badge ${job.status}">${job.status}</span></td>
                     <td><div class="stage-tracker">${stageDisplay}</div></td>
                     <td>${job.duration.toFixed(1)}s</td>
+                    <td>${job.process_time ? job.process_time.toFixed(1) + 's' : '-'}</td>
                     <td><div class="download-links">${downloads}</div></td>
                 </tr>`;
             }).join('');

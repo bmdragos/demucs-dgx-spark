@@ -44,12 +44,16 @@ import numpy as np
 import torch
 import soundfile as sf
 import librosa
+from concurrent.futures import ProcessPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import uvicorn
 
+# Process pool for CPU-bound analysis (bypasses GIL)
+analysis_pool: ProcessPoolExecutor = None
+
 # Constants
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = "2.4.0"
 RESULTS_DIR = Path("/workspace/results")
 SAMPLE_RATE = 44100
 STEMS = ["drums", "bass", "other", "vocals"]
@@ -104,6 +108,7 @@ class Job:
     duration: float = 0.0
     analysis: Optional[dict] = None  # Auto-analysis results
     stage: str = "queued"  # queued, loading, separating, saving, analyzing, complete
+    num_segments: int = 10  # Number of segment boundaries to detect
 
 
 class JobQueue:
@@ -113,13 +118,14 @@ class JobQueue:
         self.max_history = max_history
         self._lock = asyncio.Lock()
 
-    async def add(self, filename: str) -> Job:
+    async def add(self, filename: str, num_segments: int = 10) -> Job:
         job_id = str(uuid.uuid4())[:8]
         job = Job(
             id=job_id,
             status=JobStatus.QUEUED,
             created_at=datetime.now(),
-            filename=filename
+            filename=filename,
+            num_segments=num_segments
         )
         async with self._lock:
             self.jobs[job_id] = job
@@ -294,6 +300,36 @@ def detect_key(y, sr) -> str:
     return best_key
 
 
+def detect_segments(y, sr, num_segments=10) -> list:
+    """Detect structural segment boundaries using spectral clustering."""
+    # Compute chromagram for harmonic content
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+
+    # Compute MFCCs for timbral content
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+
+    # Stack features
+    features = np.vstack([chroma, mfcc])
+
+    # Compute self-similarity matrix
+    rec = librosa.segment.recurrence_matrix(features, mode='affinity', sym=True)
+
+    # Detect boundaries using spectral clustering
+    bounds = librosa.segment.agglomerative(features, num_segments)
+
+    # Convert frame indices to times
+    bound_times = librosa.frames_to_time(bounds, sr=sr)
+
+    # Add start and end times
+    duration = len(y) / sr
+    boundaries = [0.0] + [round(float(t), 3) for t in bound_times] + [round(duration, 3)]
+
+    # Remove duplicates and sort
+    boundaries = sorted(list(set(boundaries)))
+
+    return boundaries
+
+
 def get_waveform_envelope(y, sr, num_points=1000) -> list:
     """Get downsampled RMS envelope for visualization."""
     # Compute RMS energy
@@ -311,7 +347,7 @@ def get_waveform_envelope(y, sr, num_points=1000) -> list:
     return [round(float(v), 3) for v in rms]
 
 
-def analyze_audio_file(file_path: str, include_waveform: bool = True) -> dict:
+def analyze_audio_file(file_path: str, include_waveform: bool = True, num_segments: int = 10) -> dict:
     """Analyze a single audio file for BPM, beats, onsets, key, waveform."""
     y, sr = librosa.load(file_path, sr=None)
     duration = len(y) / sr
@@ -335,6 +371,9 @@ def analyze_audio_file(file_path: str, include_waveform: bool = True) -> dict:
     # Key detection
     key = detect_key(y, sr)
 
+    # Segment boundaries (structural changes)
+    segments = detect_segments(y, sr, num_segments)
+
     result = {
         "duration": round(duration, 3),
         "bpm": round(bpm, 1),
@@ -342,6 +381,7 @@ def analyze_audio_file(file_path: str, include_waveform: bool = True) -> dict:
         "beats": [round(b, 3) for b in beats],
         "downbeats": [round(d, 3) for d in downbeats],
         "onsets": [round(o, 3) for o in onsets],
+        "segments": segments,
         "beat_count": len(beats),
         "onset_count": len(onsets)
     }
@@ -433,25 +473,44 @@ async def process_audio(job: Job, audio_data: bytes):
         await job_queue.update(job.id, stage="analyzing")
         await asyncio.sleep(0)  # Yield to event loop for SSE
 
-        # Auto-analyze full mix and stems
-        print(f"Analyzing audio...")
+        # Auto-analyze full mix and stems IN PARALLEL using ProcessPool (bypasses GIL)
+        print(f"Analyzing audio (5 files in parallel via multiprocessing)...")
         analysis = {}
+        loop = asyncio.get_event_loop()
 
-        try:
-            # Analyze full mix
-            analysis["mix"] = analyze_audio_file(str(temp_wav))
-        except Exception as e:
-            analysis["mix"] = {"error": str(e)}
-        finally:
-            temp_wav.unlink()  # Clean up temp wav
+        # Build list of (name, file_path) to analyze
+        files_to_analyze = [
+            ("mix", str(temp_wav)),
+            ("drums", str(result_dir / "drums.wav")),
+            ("bass", str(result_dir / "bass.wav")),
+            ("other", str(result_dir / "other.wav")),
+            ("vocals", str(result_dir / "vocals.wav")),
+        ]
 
-        # Analyze each stem
-        for stem_name in STEMS:
-            stem_file = result_dir / f"{stem_name}.wav"
+        # Submit all to process pool (true parallelism, bypasses GIL)
+        async def analyze_in_process(name: str, file_path: str):
             try:
-                analysis[stem_name] = analyze_audio_file(str(stem_file))
+                result = await loop.run_in_executor(
+                    analysis_pool,
+                    analyze_audio_file,
+                    file_path,
+                    True,  # include_waveform
+                    job.num_segments
+                )
+                return (name, result)
             except Exception as e:
-                analysis[stem_name] = {"error": str(e)}
+                return (name, {"error": str(e)})
+
+        # Run all 5 analyses in parallel across separate processes
+        tasks = [analyze_in_process(name, path) for name, path in files_to_analyze]
+        results = await asyncio.gather(*tasks)
+
+        # Collect results into analysis dict
+        for name, result in results:
+            analysis[name] = result
+
+        # Clean up temp wav
+        temp_wav.unlink()
 
         await job_queue.update(job.id,
                                status=JobStatus.COMPLETED,
@@ -489,12 +548,18 @@ async def process_queue():
 
 @app.on_event("startup")
 async def startup():
+    global analysis_pool
+
     # Run cleanup on startup (orphaned files from previous sessions)
     cleanup_result = run_all_cleanups(job_queue.known_job_ids())
     print(f"Startup cleanup: {cleanup_result}")
 
     # Pre-load model
     load_demucs_model()
+
+    # Create process pool for parallel analysis (bypasses GIL)
+    analysis_pool = ProcessPoolExecutor(max_workers=5)
+    print("Analysis process pool ready (5 workers)")
 
     # Start queue processor
     asyncio.create_task(process_queue())
@@ -574,8 +639,16 @@ async def storage_info():
 
 
 @app.post("/separate")
-async def separate_audio(file: UploadFile = File(...)):
-    """Upload and separate audio into stems."""
+async def separate_audio(
+    file: UploadFile = File(...),
+    num_segments: int = 10
+):
+    """Upload and separate audio into stems.
+
+    Args:
+        file: Audio file to process
+        num_segments: Number of segment boundaries to detect (default 10)
+    """
     # Validate file extension
     valid_extensions = ('.wav', '.mp3', '.flac', '.m4a', '.ogg', '.aac')
     if not file.filename.lower().endswith(valid_extensions):
@@ -589,7 +662,7 @@ async def separate_audio(file: UploadFile = File(...)):
         raise HTTPException(400, "File too large (max 500MB)")
 
     # Create job
-    job = await job_queue.add(file.filename)
+    job = await job_queue.add(file.filename, num_segments=num_segments)
 
     # Save input temporarily
     temp_path = RESULTS_DIR / f"{job.id}_input.bin"
@@ -759,12 +832,21 @@ async def list_jobs(limit: int = 20):
     jobs = job_queue.list_jobs(limit)
     result = []
     for j in jobs:
+        # Calculate processing time
+        if j.completed_at and j.started_at:
+            process_time = (j.completed_at - j.started_at).total_seconds()
+        elif j.started_at:
+            process_time = (datetime.now() - j.started_at).total_seconds()
+        else:
+            process_time = 0
+
         job_data = {
             "id": j.id,
             "filename": j.filename,
             "status": j.status.value,
             "stage": j.stage,
             "duration": j.duration,
+            "process_time": round(process_time, 1),
             "created_at": j.created_at.isoformat(),
             "error": j.error
         }
@@ -790,12 +872,21 @@ async def stream_jobs():
             jobs = job_queue.list_jobs(20)
             data = []
             for j in jobs:
+                # Calculate processing time
+                if j.completed_at and j.started_at:
+                    process_time = (j.completed_at - j.started_at).total_seconds()
+                elif j.started_at:
+                    process_time = (datetime.now() - j.started_at).total_seconds()
+                else:
+                    process_time = 0
+
                 job_data = {
                     "id": j.id,
                     "filename": j.filename,
                     "status": j.status.value,
                     "stage": j.stage,
                     "duration": j.duration,
+                    "process_time": round(process_time, 1),
                     "error": j.error
                 }
                 if j.status == JobStatus.COMPLETED and j.result_path:
@@ -891,6 +982,159 @@ async def download_all_stems(job_id: str):
         zip_path,
         media_type="application/zip",
         filename=f"{base_name}_stems.zip"
+    )
+
+
+def render_stem(
+    file_path: str,
+    original_bpm: float,
+    target_bpm: float = None,
+    pitch_shift: int = None,
+    start_time: float = None,
+    end_time: float = None
+) -> tuple[np.ndarray, int]:
+    """
+    Render a stem with time-stretch, pitch-shift, and/or cut.
+    Returns (audio_array, sample_rate).
+    """
+    # Load audio
+    y, sr = librosa.load(file_path, sr=None, mono=False)
+
+    # Handle stereo vs mono
+    is_stereo = y.ndim == 2
+    if is_stereo:
+        # Process each channel
+        channels = [y[0], y[1]]
+    else:
+        channels = [y]
+
+    processed_channels = []
+    for channel in channels:
+        processed = channel
+
+        # 1. Cut first (more efficient to process less audio)
+        if start_time is not None or end_time is not None:
+            start_sample = int((start_time or 0) * sr)
+            end_sample = int((end_time or len(processed) / sr) * sr)
+            processed = processed[start_sample:end_sample]
+
+        # 2. Time-stretch to target BPM
+        if target_bpm and original_bpm and target_bpm != original_bpm:
+            # rate > 1 speeds up, rate < 1 slows down
+            rate = target_bpm / original_bpm
+            processed = librosa.effects.time_stretch(processed, rate=rate)
+
+        # 3. Pitch shift
+        if pitch_shift and pitch_shift != 0:
+            processed = librosa.effects.pitch_shift(processed, sr=sr, n_steps=pitch_shift)
+
+        processed_channels.append(processed)
+
+    # Reconstruct stereo if needed
+    if is_stereo:
+        result = np.vstack(processed_channels)
+    else:
+        result = processed_channels[0]
+
+    return result, sr
+
+
+@app.post("/jobs/{job_id}/render")
+async def render_stem_endpoint(
+    job_id: str,
+    stem: str = "vocals",
+    bpm: float = None,
+    pitch: int = None,
+    start: float = None,
+    end: float = None
+):
+    """
+    Render a stem with time-stretch, pitch-shift, and/or cut.
+
+    Args:
+        job_id: Job ID from separation
+        stem: Stem to render (drums, bass, other, vocals)
+        bpm: Target BPM (time-stretches to this tempo)
+        pitch: Semitones to shift (+/- 12 = one octave)
+        start: Start time in seconds (cuts before this)
+        end: End time in seconds (cuts after this)
+
+    Returns:
+        Rendered WAV file
+    """
+    job = await job_queue.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(400, "Job not complete")
+
+    # Validate stem
+    if stem not in STEMS:
+        raise HTTPException(400, f"Invalid stem. Use: {', '.join(STEMS)}")
+
+    result_path = Path(job.result_path)
+    stem_file = result_path / f"{stem}.wav"
+
+    if not stem_file.exists():
+        raise HTTPException(404, f"Stem file not found: {stem}")
+
+    # Get original BPM from analysis
+    original_bpm = None
+    if job.analysis and "mix" in job.analysis:
+        original_bpm = job.analysis["mix"].get("bpm")
+
+    if bpm and not original_bpm:
+        raise HTTPException(400, "Cannot time-stretch: original BPM not available")
+
+    # Render in process pool (CPU-intensive)
+    loop = asyncio.get_event_loop()
+    try:
+        audio, sr = await loop.run_in_executor(
+            analysis_pool,
+            render_stem,
+            str(stem_file),
+            original_bpm,
+            bpm,
+            pitch,
+            start,
+            end
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Render failed: {str(e)}")
+
+    # Write to temp file and return
+    base_name = Path(job.filename).stem
+
+    # Build descriptive filename
+    parts = [base_name, stem]
+    if bpm:
+        parts.append(f"{int(bpm)}bpm")
+    if pitch:
+        sign = "+" if pitch > 0 else ""
+        parts.append(f"{sign}{pitch}st")
+    if start is not None or end is not None:
+        start_str = f"{start:.1f}" if start else "0"
+        end_str = f"{end:.1f}" if end else "end"
+        parts.append(f"{start_str}-{end_str}s")
+
+    output_filename = "_".join(parts) + ".wav"
+
+    # Write to BytesIO and return
+    buffer = io.BytesIO()
+
+    # Handle stereo vs mono for soundfile
+    if audio.ndim == 2:
+        audio_to_write = audio.T  # soundfile expects (samples, channels)
+    else:
+        audio_to_write = audio
+
+    sf.write(buffer, audio_to_write, sr, format='WAV')
+    buffer.seek(0)
+
+    return StreamingResponse(
+        buffer,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{output_filename}"'}
     )
 
 
