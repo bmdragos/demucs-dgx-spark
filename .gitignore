@@ -1,0 +1,22 @@
+# Test files
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# Results directory
+results/
+test-output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# TensorRT engines (if any)
+*.engine
+*.onnx

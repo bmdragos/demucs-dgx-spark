@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Demucs - AI Audio Stem Separation</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --accent: #76b900;
+            --accent-dim: rgba(118, 185, 0, 0.15);
+            --text-primary: #f0f6fc;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+            --border: #30363d;
+            --success: #3fb950;
+            --warning: #d29922;
+            --error: #f85149;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 24px;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            margin-bottom: 48px;
+        }
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+        .logo-icon {
+            width: 56px;
+            height: 56px;
+            background: linear-gradient(135deg, var(--accent) 0%, #5a9a00 100%);
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            box-shadow: 0 8px 32px rgba(118, 185, 0, 0.3);
+        }
+        .logo h1 {
+            font-size: 42px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -1px;
+        }
+        .logo h1 span {
+            font-size: 16px;
+            font-weight: 400;
+            color: var(--text-muted);
+            margin-left: 8px;
+        }
+        .tagline {
+            color: var(--text-secondary);
+            font-size: 18px;
+        }
+        .tagline strong {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            transition: all 0.2s;
+        }
+        .stat-card:hover {
+            border-color: var(--accent);
+            box-shadow: 0 0 20px rgba(118, 185, 0, 0.1);
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--accent);
+            font-variant-numeric: tabular-nums;
+        }
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 4px;
+        }
+
+        /* Upload Area */
+        .upload-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 32px;
+        }
+        .upload-area {
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: var(--bg-primary);
+        }
+        .upload-area:hover, .upload-area.dragover {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+        }
+        .upload-icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 16px;
+            background: var(--bg-tertiary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            transition: all 0.3s;
+        }
+        .upload-area:hover .upload-icon {
+            background: var(--accent);
+            transform: scale(1.1);
+        }
+        .upload-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+        .upload-subtitle {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+        .upload-formats {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 16px;
+        }
+        .format-badge {
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .upload-area input { display: none; }
+
+        /* Status Message */
+        .status {
+            padding: 14px 18px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: none;
+            font-weight: 500;
+            animation: slideIn 0.3s ease;
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .status.success {
+            background: rgba(118, 185, 0, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(118, 185, 0, 0.3);
+            display: block;
+        }
+        .status.error {
+            background: rgba(248, 81, 73, 0.15);
+            color: var(--error);
+            border: 1px solid rgba(248, 81, 73, 0.3);
+            display: block;
+        }
+
+        /* Jobs Section */
+        .jobs-section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+        .jobs-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .jobs-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        /* Table */
+        table { width: 100%; border-collapse: collapse; }
+        th {
+            text-align: left;
+            padding: 12px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: var(--bg-tertiary);
+        }
+        td {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+
+        .job-id {
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+            background: var(--bg-tertiary);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .job-filename {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        /* Status Badges */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: capitalize;
+        }
+        .status-badge.queued { background: rgba(139, 148, 158, 0.2); color: var(--text-secondary); }
+        .status-badge.processing { background: rgba(210, 153, 34, 0.2); color: var(--warning); }
+        .status-badge.completed { background: rgba(63, 185, 80, 0.2); color: var(--success); }
+        .status-badge.failed { background: rgba(248, 81, 73, 0.2); color: var(--error); }
+        .status-badge::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .status-badge.processing::before {
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Progress Bar */
+        .progress-bar {
+            width: 100px;
+            height: 6px;
+            background: var(--bg-tertiary);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent), #9be000);
+            border-radius: 3px;
+            transition: width 0.3s;
+        }
+
+        /* Download Links */
+        .download-links {
+            display: flex;
+            flex-wrap: nowrap;
+            gap: 6px;
+            align-items: center;
+        }
+        .stem-btn {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            text-decoration: none;
+            padding: 6px 10px;
+            border-radius: 8px;
+            transition: all 0.2s;
+            width: 72px;
+        }
+        .stem-btn:hover {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+        }
+        .stem-name {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: capitalize;
+        }
+        .stem-size {
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+        .stem-type {
+            font-size: 9px;
+            color: var(--accent);
+            font-weight: 500;
+            margin-top: 2px;
+        }
+        .zip-btn {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background: linear-gradient(135deg, var(--accent), #5a9a00);
+            color: #000;
+            padding: 6px 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            transition: all 0.2s;
+            box-shadow: 0 2px 8px rgba(118, 185, 0, 0.3);
+            width: 72px;
+        }
+        .zip-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(118, 185, 0, 0.4);
+        }
+        .zip-name { font-size: 12px; font-weight: 600; }
+        .zip-size { font-size: 10px; opacity: 0.8; margin-top: 2px; }
+        .zip-type { font-size: 9px; font-weight: 500; margin-top: 2px; }
+
+        .empty-state {
+            padding: 48px 24px;
+            text-align: center;
+            color: var(--text-muted);
+        }
+
+        /* Footer */
+        .footer {
+            text-align: center;
+            padding: 32px;
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+        .footer a {
+            color: var(--text-secondary);
+            text-decoration: none;
+        }
+        .footer a:hover { color: var(--accent); }
+        .footer-divider {
+            margin: 0 12px;
+            opacity: 0.3;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .logo h1 { font-size: 32px; }
+            .upload-area { padding: 32px 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">&#127925;</div>
+                <h1>Demucs<span id="version"></span></h1>
+            </div>
+            <p class="tagline">AI-powered audio stem separation on <strong>DGX Spark</strong></p>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" id="gpu-util">-</div>
+                <div class="stat-label">GPU Utilization</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="gpu-mem">-</div>
+                <div class="stat-label">VRAM Used</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="gpu-temp">-</div>
+                <div class="stat-label">GPU Temp</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="queue-size">0</div>
+                <div class="stat-label">Queue</div>
+            </div>
+        </div>
+
+        <div class="upload-section">
+            <div id="status" class="status"></div>
+            <div class="upload-area" id="dropzone">
+                <div class="upload-icon">&#128190;</div>
+                <div class="upload-title">Drop audio file here</div>
+                <div class="upload-subtitle">or click to browse</div>
+                <div class="upload-formats">
+                    <span class="format-badge">WAV</span>
+                    <span class="format-badge">MP3</span>
+                    <span class="format-badge">FLAC</span>
+                    <span class="format-badge">M4A</span>
+                </div>
+                <input type="file" id="fileInput" accept=".wav,.mp3,.flac,.m4a,audio/*">
+            </div>
+        </div>
+
+        <div class="jobs-section">
+            <div class="jobs-header">
+                <span class="jobs-title">Recent Jobs</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>File</th>
+                        <th>Status</th>
+                        <th>Progress</th>
+                        <th>Duration</th>
+                        <th>Download</th>
+                    </tr>
+                </thead>
+                <tbody id="jobs-body">
+                    <tr><td colspan="6" class="empty-state">No jobs yet - upload a file to get started</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <footer class="footer">
+            Stems: drums, bass, other, vocals
+            <span class="footer-divider">|</span>
+            Model: htdemucs
+            <span class="footer-divider">|</span>
+            <a href="/health">API Health</a>
+            <span class="footer-divider">|</span>
+            <a href="/storage">Storage</a>
+        </footer>
+    </div>
+
+    <script>
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const status = document.getElementById('status');
+        const jobsBody = document.getElementById('jobs-body');
+        const stems = ['drums', 'bass', 'other', 'vocals'];
+
+        dropzone.onclick = () => fileInput.click();
+        dropzone.ondragover = (e) => { e.preventDefault(); dropzone.classList.add('dragover'); };
+        dropzone.ondragleave = () => dropzone.classList.remove('dragover');
+        dropzone.ondrop = (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+        };
+        fileInput.onchange = () => { if (fileInput.files.length) uploadFile(fileInput.files[0]); };
+
+        let statusTimeout = null;
+
+        function showStatus(message, isError = false) {
+            if (statusTimeout) clearTimeout(statusTimeout);
+            status.className = 'status ' + (isError ? 'error' : 'success');
+            status.textContent = message;
+            // Auto-dismiss success messages after 5s, errors stay longer
+            statusTimeout = setTimeout(() => {
+                status.className = 'status';
+            }, isError ? 10000 : 5000);
+        }
+
+        async function uploadFile(file) {
+            showStatus('Uploading ' + file.name + '...');
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const resp = await fetch('/separate', { method: 'POST', body: formData });
+                const data = await resp.json();
+                if (resp.ok) {
+                    showStatus('Queued! Job ID: ' + data.job_id);
+                    refreshJobs();
+                } else {
+                    showStatus('Error: ' + (data.detail || 'Upload failed'), true);
+                }
+            } catch (err) {
+                showStatus('Error: ' + err.message, true);
+            }
+        }
+
+        function renderJobs(jobs) {
+            if (!jobs.length) {
+                jobsBody.innerHTML = '<tr><td colspan="6" class="empty-state">No jobs yet - upload a file to get started</td></tr>';
+                return;
+            }
+
+            jobsBody.innerHTML = jobs.map(job => {
+                const filename = job.filename.length > 25 ? job.filename.slice(0, 25) + '...' : job.filename;
+                const progressPct = (job.progress * 100).toFixed(0);
+
+                let downloads = '';
+                if (job.status === 'completed') {
+                    const stemBtns = stems.map(s => {
+                        const size = job.sizes?.[s] || '';
+                        return `<a href="/jobs/${job.id}/download/${s}.wav" class="stem-btn">
+                            <span class="stem-name">${s}</span>
+                            <span class="stem-size">${size}</span>
+                            <span class="stem-type">WAV</span>
+                        </a>`;
+                    }).join('');
+                    const totalSize = job.sizes?.total || '';
+                    downloads = `${stemBtns}<a href="/jobs/${job.id}/download_all" class="zip-btn">
+                        <span class="zip-name">All</span>
+                        <span class="zip-size">${totalSize}</span>
+                        <span class="zip-type">ZIP</span>
+                    </a>`;
+                } else if (job.status === 'failed') {
+                    downloads = `<span style="color:var(--error);font-size:12px">${job.error?.slice(0,30) || 'Failed'}</span>`;
+                }
+
+                return `<tr>
+                    <td><span class="job-id">${job.id}</span></td>
+                    <td><span class="job-filename" title="${job.filename}">${filename}</span></td>
+                    <td><span class="status-badge ${job.status}">${job.status}</span></td>
+                    <td><div class="progress-bar"><div class="progress-fill" style="width:${progressPct}%"></div></div></td>
+                    <td>${job.duration.toFixed(1)}s</td>
+                    <td><div class="download-links">${downloads}</div></td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function refreshJobs() {
+            try {
+                const resp = await fetch('/jobs');
+                const data = await resp.json();
+                renderJobs(data.jobs);
+                const hasActive = data.jobs.some(j => j.status === 'queued' || j.status === 'processing');
+                if (hasActive) setTimeout(refreshJobs, 2000);
+            } catch (err) { console.error('Failed to refresh jobs:', err); }
+        }
+
+        async function refreshStats() {
+            try {
+                const resp = await fetch('/health');
+                const data = await resp.json();
+                document.getElementById('version').textContent = 'v' + data.version;
+                document.getElementById('queue-size').textContent = data.queue_size;
+                if (data.gpu) {
+                    document.getElementById('gpu-util').textContent = (data.gpu.utilization || 'N/A') + '%';
+                    document.getElementById('gpu-mem').textContent = data.gpu.memory_used || 'N/A';
+                    document.getElementById('gpu-temp').textContent = (data.gpu.temperature || 'N/A') + '°C';
+                }
+            } catch (err) { console.error('Failed to refresh stats:', err); }
+        }
+
+        refreshStats();
+        refreshJobs();
+        setInterval(refreshStats, 5000);
+    </script>
+</body>
+</html>
