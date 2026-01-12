@@ -29,7 +29,7 @@ docker run -d --name demucs --runtime=nvidia --gpus all \
 
 ```bash
 # Clone this repo
-git clone https://github.com/YOUR_USERNAME/demucs-dgx-spark.git
+git clone https://github.com/bmdragos/demucs-dgx-spark.git
 cd demucs-dgx-spark
 
 # Copy to DGX Spark
