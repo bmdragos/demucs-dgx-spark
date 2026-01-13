@@ -226,7 +226,7 @@ MAX_JOB_HISTORY = 50          # Jobs to keep in memory
 
 ## Environment
 
-- **Hardware:** DGX Spark (GB10 GPU, 120GB unified memory, ARM64)
+- **Hardware:** DGX Spark (GB10 GPU, 128GB unified memory, ARM64)
 - **Container:** `nvcr.io/nvidia/pytorch:25.12-py3`
 - **Models:**
   - Demucs htdemucs (hybrid transformer) - stem separation
